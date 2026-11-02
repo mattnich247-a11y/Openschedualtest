@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Open Schedule — Employee & Staff Guide</title>
+  <style>
+    :root {
+      --primary: #059669;
+      --primary-dark: #047857;
+      --primary-light: #ecfdf5;
+      --slate-50: #f8fafc;
+      --slate-100: #f1f5f9;
+      --slate-200: #e2e8f0;
+      --slate-300: #cbd5e1;
+      --slate-600: #475569;
+      --slate-700: #334155;
+      --slate-800: #1e293b;
+      --slate-900: #0f172a;
+    }
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background-color: var(--slate-50);
+      color: var(--slate-800);
+      line-height: 1.6;
+      padding: 2rem 1rem;
+    }
+    .container {
+      max-width: 768px;
+      margin: 0 auto;
+      background: #ffffff;
+      border: 1px solid var(--slate-200);
+      border-radius: 1.5rem;
+      padding: 2.5rem;
+      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.05);
+    }
+    header {
+      border-bottom: 1px solid var(--slate-200);
+      padding-bottom: 1.5rem;
+      margin-bottom: 2rem;
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+    .logo-icon {
+      width: 48px;
+      height: 48px;
+      background: var(--primary-light);
+      color: var(--primary);
+      border-radius: 1rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: bold;
+      font-size: 1.5rem;
+    }
+    h1 {
+      font-size: 1.5rem;
+      font-weight: 800;
+      color: var(--slate-900);
+    }
+    .subtitle {
+      font-size: 0.875rem;
+      color: var(--slate-600);
+    }
+    h2 {
+      font-size: 1.25rem;
+      font-weight: 700;
+      color: var(--slate-900);
+      margin-top: 2rem;
+      margin-bottom: 0.75rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .step-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      background: var(--primary);
+      color: white;
+      font-size: 0.75rem;
+      font-weight: bold;
+    }
+    p {
+      margin-bottom: 1rem;
+      font-size: 0.9375rem;
+      color: var(--slate-700);
+    }
+    ul, ol {
+      margin-bottom: 1.25rem;
+      padding-left: 1.5rem;
+      font-size: 0.9375rem;
+      color: var(--slate-700);
+    }
+    li {
+      margin-bottom: 0.5rem;
+    }
+    .tip-box {
+      background: var(--primary-light);
+      border-left: 4px solid var(--primary);
+      border-radius: 0.5rem;
+      padding: 1rem;
+      margin: 1.25rem 0;
+      font-size: 0.875rem;
+      color: var(--slate-800);
+    }
+    .tip-box strong {
+      color: var(--primary-dark);
+    }
+    .btn-close {
+      display: inline-block;
+      margin-top: 2rem;
+      background: var(--slate-800);
+      color: white;
+      text-decoration: none;
+      padding: 0.75rem 1.5rem;
+      border-radius: 0.75rem;
+      font-size: 0.875rem;
+      font-weight: 600;
+      border: none;
+      cursor: pointer;
+    }
+    .btn-close:hover {
+      background: var(--slate-900);
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="logo-icon">📅</div>
+      <div>
+        <h1>Open Schedule — Staff Guide</h1>
+        <div class="subtitle">Quick reference guide for team members and staff</div>
+      </div>
+    </header>
+
+    <h2><span class="step-badge">1</span> Logging In</h2>
+    <p>To access your personal schedule and timeclock on Open Schedule:</p>
+    <ul>
+      <li><strong>If you received a welcome link:</strong> Click the link from your manager. It will automatically connect to your organization's cloud server.</li>
+      <li><strong>If connecting manually:</strong> Enter the Cloud Server URL and Public Key provided by your manager. Once saved, your browser will remember the server.</li>
+      <li><strong>Enter your username & password:</strong> Type your assigned employee username and password to log in directly into Employee View.</li>
+    </ul>
+
+    <h2><span class="step-badge">2</span> Viewing Your Schedule</h2>
+    <p>Once logged in, your personalized mobile dashboard displays:</p>
+    <ul>
+      <li><strong>Upcoming Shifts:</strong> View your assigned dates, start and end times, department, and role.</li>
+      <li><strong>Shift Sync:</strong> Add your shifts to your phone's personal calendar (iCal / Google Calendar) with one tap.</li>
+    </ul>
+
+    <h2><span class="step-badge">3</span> Clocking In & Out</h2>
+    <p>You can record your punches depending on your workplace configuration:</p>
+    <ul>
+      <li><strong>Smartphone Mobile Clock-In:</strong> Tap Clock In when you are inside the workplace geofence.</li>
+      <li><strong>2-Minute Kiosk Check-In Code:</strong> If you are outside the geofence or GPS is unavailable, enter the 2-minute rolling code displayed on your workplace's shared Kiosk tablet.</li>
+      <li><strong>Shared Kiosk Tablet:</strong> You can also clock in directly on the breakroom Kiosk tablet using your 4-digit PIN.</li>
+    </ul>
+
+    <h2><span class="step-badge">4</span> Shift Swaps & Open Shifts</h2>
+    <p>Need time off or extra hours?</p>
+    <ul>
+      <li><strong>Up for Grabs:</strong> Post an upcoming shift if you need a qualified coworker to cover it.</li>
+      <li><strong>Claiming Shifts:</strong> Browse open shifts posted by coworkers and claim them to add them to your schedule.</li>
+    </ul>
+
+    <h2><span class="step-badge">5</span> Availability & Time Off</h2>
+    <ul>
+      <li><strong>Availability:</strong> Submit your recurring weekly preferred and unavailable hours so managers schedule you when you're free.</li>
+      <li><strong>Time-Off Requests:</strong> Request specific days off in advance. You'll receive a confirmation when approved by management.</li>
+    </ul>
+
+    <div class="tip-box">
+      <strong>🔒 Privacy & Security:</strong> Your password and personal details are protected by local encryption in your browser. Never share your password or Kiosk PIN with others.
+    </div>
+
+    <button type="button" class="btn-close" onclick="window.close()">Close Guide</button>
+  </div>
+</body>
+</html>

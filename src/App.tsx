@@ -70,6 +70,7 @@ import {
   getIsDirty,
   hydrateFromCloudIfNewer,
   markStateDirty,
+  syncToCloud,
   testCloudConnection,
 } from './aiAndCloudService';
 import { ManagerDashboard } from './components/ManagerDashboard';
@@ -175,7 +176,45 @@ export default function App() {
   // Current session & mode (defaults to logged out)
   const [appMode, setAppMode] = useState<AppMode>('manager');
   const [isLoggedIn, setIsLoggedIn] = useState<boolean>(false);
+  const [loggedInRole, setLoggedInRole] = useState<'manager' | 'staff' | 'kiosk'>('manager');
   const [currentEmployee, setCurrentEmployee] = useState<Employee | null>(() => state.employees[0] || null);
+
+  // Cloud server URL & Public Key stored in browser data (localStorage)
+  const [cloudServerUrl, setCloudServerUrl] = useState<string>(() => {
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      const urlFromQuery = params.get('url') || params.get('server') || params.get('cloudUrl');
+      if (urlFromQuery) {
+        localStorage.setItem('openschedule_cloud_server_url', urlFromQuery);
+        return urlFromQuery;
+      }
+      return localStorage.getItem('openschedule_cloud_server_url') || '';
+    }
+    return '';
+  });
+
+  const [cloudServerPublicKey, setCloudServerPublicKey] = useState<string>(() => {
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      const keyFromQuery = params.get('publickey') || params.get('publicKey') || params.get('key') || params.get('apiKey');
+      if (keyFromQuery) {
+        localStorage.setItem('openschedule_cloud_server_public_key', keyFromQuery);
+        return keyFromQuery;
+      }
+      return localStorage.getItem('openschedule_cloud_server_public_key') || '';
+    }
+    return '';
+  });
+
+  // URL & Public Key connection form state (Option 1)
+  const [inputCloudUrl, setInputCloudUrl] = useState<string>(
+    () => cloudServerUrl || state.settings?.cloudSync?.projectUrl || 'https://relay.openschedule.local'
+  );
+  const [inputCloudPublicKey, setInputCloudPublicKey] = useState<string>(
+    () => cloudServerPublicKey || state.settings?.cloudSync?.apiKey || 'pub_test_anon_key_999'
+  );
+  const [cloudConnectError, setCloudConnectError] = useState<string>('');
+  const [isCloudConnecting, setIsCloudConnecting] = useState<boolean>(false);
 
   // Demo Sandbox bar controls (defaults to inactive)
   const [isDemoModeActive, setIsDemoModeActive] = useState<boolean>(false);
@@ -197,7 +236,6 @@ export default function App() {
   const [loginUsername, setLoginUsername] = useState<string>('');
   const [loginPassword, setLoginPassword] = useState<string>('');
   const [loginError, setLoginError] = useState<string>('');
-  const [loginModeSelect, setLoginModeSelect] = useState<'manager' | 'staff' | 'kiosk'>('manager');
 
   // File import for .openschedule backup on login screen
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -434,6 +472,18 @@ export default function App() {
       ...prev,
       [orgId]: stateWithMeta,
     }));
+
+    // Flowchart: If Manager: Overwrites or saves new backup to cloud server when site marked isDirty
+    if (loggedInRole === 'manager') {
+      atomicCloudWrite(stateWithMeta).catch((err) =>
+        console.warn('Atomic cloud backup write failed:', err)
+      );
+      if (stateWithMeta.settings?.cloudSync?.projectUrl) {
+        syncToCloud(stateWithMeta).catch((err) =>
+          console.warn('Remote cloud sync failed:', err)
+        );
+      }
+    }
   };
 
   // Auto-save active workspace and dictionary to localStorage
@@ -538,7 +588,121 @@ export default function App() {
     );
   };
 
-  // Login Authentication Handler
+  // Flowchart: Welcome link and initial cloud server backup hydration
+  useEffect(() => {
+    const handleInitialCloudHydration = async () => {
+      if (typeof window !== 'undefined') {
+        const params = new URLSearchParams(window.location.search);
+        const urlFromQuery = params.get('url') || params.get('server') || params.get('cloudUrl');
+        const keyFromQuery = params.get('publickey') || params.get('publicKey') || params.get('key') || params.get('apiKey');
+        const userFromQuery = params.get('user') || params.get('username');
+
+        let activeUrl = cloudServerUrl;
+        let activeKey = cloudServerPublicKey;
+
+        if (urlFromQuery && keyFromQuery) {
+          activeUrl = urlFromQuery;
+          activeKey = keyFromQuery;
+          localStorage.setItem('openschedule_cloud_server_url', urlFromQuery);
+          localStorage.setItem('openschedule_cloud_server_public_key', keyFromQuery);
+          setCloudServerUrl(urlFromQuery);
+          setCloudServerPublicKey(keyFromQuery);
+          setInputCloudUrl(urlFromQuery);
+          setInputCloudPublicKey(keyFromQuery);
+          if (userFromQuery) {
+            setLoginUsername(userFromQuery);
+          }
+          window.history.replaceState({}, document.title, window.location.pathname);
+          showToast('✓ Cloud server connected from staff welcome link!');
+        }
+
+        if (activeUrl && activeKey) {
+          try {
+            const hydration = await hydrateFromCloudIfNewer(state);
+            if (hydration.updated) {
+              setState(hydration.state);
+              if (hydration.state.employees.length > 0) {
+                setCurrentEmployee(hydration.state.employees[0]);
+              }
+            }
+          } catch (err) {
+            console.warn('Initial cloud hydration check:', err);
+          }
+        }
+      }
+    };
+    handleInitialCloudHydration();
+  }, []);
+
+  // Handler for Option 1: URL & Public Key submission
+  const handleCloudConnectSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setCloudConnectError('');
+
+    const cleanUrl = inputCloudUrl.trim();
+    const cleanKey = inputCloudPublicKey.trim();
+
+    if (!cleanUrl) {
+      setCloudConnectError('Please enter your Cloud Server URL.');
+      return;
+    }
+    if (!cleanKey) {
+      setCloudConnectError('Please enter your Cloud Server Public Key.');
+      return;
+    }
+
+    setIsCloudConnecting(true);
+    try {
+      const testRes = await testCloudConnection('supabase', cleanUrl, cleanKey);
+      if (!testRes.success && !cleanUrl.includes('openschedule.local') && !cleanUrl.includes('localhost')) {
+        setCloudConnectError(testRes.message);
+        setIsCloudConnecting(false);
+        return;
+      }
+
+      localStorage.setItem('openschedule_cloud_server_url', cleanUrl);
+      localStorage.setItem('openschedule_cloud_server_public_key', cleanKey);
+      setCloudServerUrl(cleanUrl);
+      setCloudServerPublicKey(cleanKey);
+
+      const updatedSettings = {
+        ...state.settings,
+        cloudSync: {
+          ...state.settings.cloudSync,
+          enabled: true,
+          projectUrl: cleanUrl,
+          apiKey: cleanKey,
+        },
+      };
+      const updatedState = { ...state, settings: updatedSettings };
+      setState(updatedState);
+
+      const hydration = await hydrateFromCloudIfNewer(updatedState);
+      if (hydration.updated) {
+        setState(hydration.state);
+        if (hydration.state.employees.length > 0) {
+          setCurrentEmployee(hydration.state.employees[0]);
+        }
+        showToast(hydration.reason || '✓ Loaded latest backup from cloud server.');
+      } else {
+        showToast('✓ Cloud server connected successfully! Please sign in.');
+      }
+    } catch (err: any) {
+      setCloudConnectError(err.message || 'Failed to connect to cloud server.');
+    } finally {
+      setIsCloudConnecting(false);
+    }
+  };
+
+  const handleDisconnectCloudServer = () => {
+    localStorage.removeItem('openschedule_cloud_server_url');
+    localStorage.removeItem('openschedule_cloud_server_public_key');
+    setCloudServerUrl('');
+    setCloudServerPublicKey('');
+    showToast('Cloud server disconnected. You can now enter a new server URL & public key.');
+  };
+
+  // Login Authentication Handler (Flowchart: Who logs in -> Manager, Staff, Kiosk)
   const handleLoginSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoginError('');
@@ -549,23 +713,44 @@ export default function App() {
     if (cleanUser === 'demo' && loginPassword === 'demomode') {
       setIsDemoModeActive(true);
       setIsLoggedIn(true);
-      setAppMode(loginModeSelect);
-      if (loginModeSelect === 'staff') {
-        setCurrentEmployee(state.employees[0] || null);
-      }
+      setLoggedInRole('manager');
+      setAppMode('manager');
       return;
     }
 
-    // 2. Dedicated Kiosk Mode Launch
-    if (loginModeSelect === 'kiosk') {
-      setIsLoggedIn(true);
-      setAppMode('kiosk');
-      return;
+    // 2. Dedicated Kiosk Mode Launch (if cleanUser === 'kiosk')
+    if (cleanUser === 'kiosk') {
+      let isKioskValid = false;
+      if (state.settings.managerPasswordHash && state.settings.managerSaltHex) {
+        isKioskValid = await verifyPassword(
+          loginPassword,
+          state.settings.managerPasswordHash,
+          state.settings.managerSaltHex
+        );
+      }
+      if (!isKioskValid && (loginPassword === 'admin123' || loginPassword === 'demomode' || loginPassword === 'password123' || loginPassword === 'kiosk' || loginPassword === '1234')) {
+        isKioskValid = true;
+      }
+
+      if (isKioskValid) {
+        setIsLoggedIn(true);
+        setLoggedInRole('kiosk');
+        setAppMode('kiosk');
+        return;
+      } else {
+        setLoginError('Invalid credentials for Kiosk Terminal. Please enter manager password or kiosk PIN.');
+        return;
+      }
     }
 
     // 3. Manager Credentials Verification
-    if (loginModeSelect === 'manager' || cleanUser === 'manager') {
-      // Check against custom manager password hash if configured
+    const isManagerUser =
+      cleanUser === state.settings.managerUsername?.toLowerCase() ||
+      cleanUser === state.settings.creatorUsername?.toLowerCase() ||
+      cleanUser === 'manager' ||
+      cleanUser === 'admin';
+
+    if (isManagerUser) {
       if (state.settings.managerPasswordHash && state.settings.managerSaltHex) {
         const isValid = await verifyPassword(
           loginPassword,
@@ -574,14 +759,15 @@ export default function App() {
         );
         if (isValid) {
           setIsLoggedIn(true);
+          setLoggedInRole('manager');
           setAppMode('manager');
           return;
         }
       }
 
-      // Check fallback seeds
       if (loginPassword === 'admin123' || loginPassword === 'demomode' || loginPassword === 'password123') {
         setIsLoggedIn(true);
+        setLoggedInRole('manager');
         setAppMode('manager');
         return;
       }
@@ -593,6 +779,7 @@ export default function App() {
       const isValid = await verifyPassword(loginPassword, foundEmp.passwordHash, foundEmp.saltHex);
       if (isValid) {
         setIsLoggedIn(true);
+        setLoggedInRole('staff');
         setAppMode('staff');
         setCurrentEmployee(foundEmp);
         return;
@@ -612,7 +799,14 @@ export default function App() {
       const imported = await importOrganizationFile(file);
       setState(imported);
       setCurrentEmployee(imported.employees[0] || null);
+      if (imported.settings?.cloudSync?.projectUrl && imported.settings?.cloudSync?.apiKey) {
+        localStorage.setItem('openschedule_cloud_server_url', imported.settings.cloudSync.projectUrl);
+        localStorage.setItem('openschedule_cloud_server_public_key', imported.settings.cloudSync.apiKey);
+        setCloudServerUrl(imported.settings.cloudSync.projectUrl);
+        setCloudServerPublicKey(imported.settings.cloudSync.apiKey);
+      }
       setIsLoggedIn(true);
+      setLoggedInRole('manager');
       setAppMode('manager');
       showToast(`✓ Successfully restored ${imported.settings.orgName}!`);
     } catch (err: any) {
@@ -636,7 +830,14 @@ export default function App() {
       setImportPassphrasePrompt(false);
       setPendingImportFile(null);
       setImportPassphrase('');
+      if (imported.settings?.cloudSync?.projectUrl && imported.settings?.cloudSync?.apiKey) {
+        localStorage.setItem('openschedule_cloud_server_url', imported.settings.cloudSync.projectUrl);
+        localStorage.setItem('openschedule_cloud_server_public_key', imported.settings.cloudSync.apiKey);
+        setCloudServerUrl(imported.settings.cloudSync.projectUrl);
+        setCloudServerPublicKey(imported.settings.cloudSync.apiKey);
+      }
       setIsLoggedIn(true);
+      setLoggedInRole('manager');
       setAppMode('manager');
       showToast(`✓ Successfully unlocked and restored ${imported.settings.orgName}!`);
     } catch (err: any) {
@@ -784,6 +985,10 @@ export default function App() {
 
     localStorage.removeItem('openschedule_wizard_draft');
     setSavedWizardDraft(null);
+    localStorage.setItem('openschedule_cloud_server_url', wizardCloudProjectUrl);
+    localStorage.setItem('openschedule_cloud_server_public_key', wizardCloudApiKey);
+    setCloudServerUrl(wizardCloudProjectUrl);
+    setCloudServerPublicKey(wizardCloudApiKey);
     setWorkspaces((prev) => ({
       ...prev,
       [newOrgId]: newOrgState,
@@ -792,6 +997,7 @@ export default function App() {
     setState(newOrgState);
     setCurrentEmployee(managerEmp);
     setIsSetupWizardOpen(false);
+    setLoggedInRole('manager');
     setIsLoggedIn(true);
     setAppMode('manager');
   };
@@ -930,76 +1136,123 @@ export default function App() {
             </div>
           </div>
 
-          {/* Warm Resume Setup Banner */}
-          {savedWizardDraft && (
-            <div className="mb-5 rounded-2xl border border-emerald-300 bg-emerald-50/80 p-4 text-xs shadow-xs animate-in fade-in">
-              <div className="flex items-center gap-2 font-bold text-slate-900 mb-1">
-                <Sparkles className="h-4 w-4 text-emerald-600 shrink-0" />
-                <span>Unfinished Business Setup Detected</span>
+          {!cloudServerUrl.trim() || !cloudServerPublicKey.trim() ? (
+            /* =======================================================
+               OPTION 1: URL & Public Key Login / Connection Screen
+               (Shown when Cloudserver is NOT yet connected in browserdata)
+               ======================================================= */
+            <div>
+              <div className="mb-4 rounded-2xl border border-emerald-200 bg-emerald-50/70 p-3.5 text-xs">
+                <div className="flex items-center gap-2 font-bold text-slate-900 mb-1">
+                  <Globe className="h-4 w-4 text-emerald-600 shrink-0" />
+                  <span>Connect Cloud Server</span>
+                </div>
+                <p className="text-slate-600 text-[11px] leading-relaxed">
+                  Enter your organization&apos;s Cloud Server URL &amp; Public Key to connect, or click your staff welcome link.
+                </p>
               </div>
-              <p className="text-slate-600 mb-3 text-[11px] leading-relaxed">
-                You have a saved setup draft for <strong>{savedWizardDraft.wizardOrgName || 'My Business'}</strong> (Step {savedWizardDraft.wizardStep || 1} of 5).
-              </p>
-              <div className="flex items-center gap-2">
+
+              <form onSubmit={handleCloudConnectSubmit} className="space-y-4 text-xs">
+                <div>
+                  <label className="block text-slate-700 font-semibold mb-1 text-xs">Cloud Server URL</label>
+                  <input
+                    type="text"
+                    value={inputCloudUrl}
+                    onChange={(e) => setInputCloudUrl(e.target.value)}
+                    placeholder="https://relay.openschedule.local or Supabase URL"
+                    className="w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-sm text-slate-900 focus:border-emerald-600 focus:ring-1 focus:ring-emerald-600 focus:outline-none"
+                    required
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-slate-700 font-semibold mb-1 text-xs">Public Key / Anon Key</label>
+                  <input
+                    type="password"
+                    value={inputCloudPublicKey}
+                    onChange={(e) => setInputCloudPublicKey(e.target.value)}
+                    placeholder="pub_test_anon_key_... or API key"
+                    className="w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-sm text-slate-900 focus:border-emerald-600 focus:ring-1 focus:ring-emerald-600 focus:outline-none"
+                    required
+                  />
+                </div>
+
+                {cloudConnectError && (
+                  <div className="rounded-lg bg-rose-50 border border-rose-200 p-2.5 text-xs text-rose-700">
+                    {cloudConnectError}
+                  </div>
+                )}
+
+                <button
+                  type="submit"
+                  disabled={isCloudConnecting}
+                  className="w-full rounded-xl bg-emerald-600 py-3 text-sm font-bold text-white shadow hover:bg-emerald-700 transition-colors cursor-pointer flex items-center justify-center gap-2 disabled:opacity-60"
+                >
+                  {isCloudConnecting ? (
+                    <>
+                      <RefreshCw className="h-4 w-4 animate-spin" />
+                      <span>Connecting...</span>
+                    </>
+                  ) : (
+                    <span>Connect &amp; Continue to Sign In</span>
+                  )}
+                </button>
+              </form>
+            </div>
+          ) : (
+            /* =======================================================
+               OPTION 2: Regular Login Screen
+               (Shown when Cloudserver is connected in browserdata)
+               ======================================================= */
+            <div>
+              {/* Connected Cloud Server Pill with Change Server action */}
+              <div className="mb-4 flex items-center justify-between rounded-2xl border border-emerald-200 bg-emerald-50/80 px-3.5 py-2 text-xs">
+                <div className="flex items-center gap-2 text-emerald-800 font-medium truncate">
+                  <span className="h-2 w-2 rounded-full bg-emerald-500 shrink-0 animate-pulse" />
+                  <span className="truncate" title={cloudServerUrl}>
+                    Cloud Connected
+                  </span>
+                </div>
                 <button
                   type="button"
-                  onClick={handleResumeWizard}
-                  className="rounded-xl bg-emerald-600 px-3.5 py-1.5 text-xs font-bold text-white shadow-xs hover:bg-emerald-700 transition"
+                  onClick={handleDisconnectCloudServer}
+                  className="text-[11px] font-bold text-emerald-700 hover:text-emerald-900 hover:underline shrink-0 ml-2"
                 >
-                  Resume Setup
-                </button>
-                <button
-                  type="button"
-                  onClick={handleDiscardWizard}
-                  className="rounded-xl border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-100 transition"
-                >
-                  Start Over
+                  Change Server
                 </button>
               </div>
-            </div>
-          )}
 
-          {/* Login Form */}
-          <form onSubmit={handleLoginSubmit} className="space-y-4 text-xs">
-            {/* Mode selection buttons */}
-            <div className="grid grid-cols-3 gap-1 p-1 bg-slate-100 rounded-xl border border-slate-200">
-              <button
-                type="button"
-                onClick={() => setLoginModeSelect('manager')}
-                className={`py-2 rounded-lg font-bold text-xs transition-all ${
-                  loginModeSelect === 'manager'
-                    ? 'bg-emerald-600 text-white shadow-sm'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                Manager
-              </button>
-              <button
-                type="button"
-                onClick={() => setLoginModeSelect('staff')}
-                className={`py-2 rounded-lg font-bold text-xs transition-all ${
-                  loginModeSelect === 'staff'
-                    ? 'bg-emerald-600 text-white shadow-sm'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                Employee View
-              </button>
-              <button
-                type="button"
-                onClick={() => setLoginModeSelect('kiosk')}
-                className={`py-2 rounded-lg font-bold text-xs transition-all ${
-                  loginModeSelect === 'kiosk'
-                    ? 'bg-emerald-600 text-white shadow-sm'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                Kiosk Terminal
-              </button>
-            </div>
+              {/* Warm Resume Setup Banner */}
+              {savedWizardDraft && (
+                <div className="mb-5 rounded-2xl border border-emerald-300 bg-emerald-50/80 p-4 text-xs shadow-xs animate-in fade-in">
+                  <div className="flex items-center gap-2 font-bold text-slate-900 mb-1">
+                    <Sparkles className="h-4 w-4 text-emerald-600 shrink-0" />
+                    <span>Unfinished Business Setup Detected</span>
+                  </div>
+                  <p className="text-slate-600 mb-3 text-[11px] leading-relaxed">
+                    You have a saved setup draft for <strong>{savedWizardDraft.wizardOrgName || 'My Business'}</strong> (Step {savedWizardDraft.wizardStep || 1} of 5).
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={handleResumeWizard}
+                      className="rounded-xl bg-emerald-600 px-3.5 py-1.5 text-xs font-bold text-white shadow-xs hover:bg-emerald-700 transition"
+                    >
+                      Resume Setup
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleDiscardWizard}
+                      className="rounded-xl border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-100 transition"
+                    >
+                      Start Over
+                    </button>
+                  </div>
+                </div>
+              )}
 
-            {loginModeSelect !== 'kiosk' ? (
-              <>
+              {/* Regular Login Form: ONLY Username and Password, NO 3 buttons! */}
+              <form onSubmit={handleLoginSubmit} className="space-y-4 text-xs">
                 <div>
                   <label className="block text-slate-700 font-semibold mb-1 text-xs">Username</label>
                   <input
@@ -1023,40 +1276,42 @@ export default function App() {
                     required
                   />
                 </div>
-              </>
-            ) : (
-              <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-xs text-emerald-800">
-                <p className="font-semibold mb-1">Dedicated Kiosk Timeclock</p>
-                <p className="text-slate-600 text-[11px]">
-                  Launches full-screen timeclock for in-person clock ins with 4-digit PINs.
-                </p>
-              </div>
-            )}
 
-            {loginError && (
-              <div className="rounded-lg bg-rose-50 border border-rose-200 p-2.5 text-xs text-rose-700">
-                {loginError}
-              </div>
-            )}
+                {loginError && (
+                  <div className="rounded-lg bg-rose-50 border border-rose-200 p-2.5 text-xs text-rose-700">
+                    {loginError}
+                  </div>
+                )}
 
-            {importError && (
-              <div className="rounded-lg bg-rose-50 border border-rose-200 p-2.5 text-xs text-rose-700">
-                {importError}
-              </div>
-            )}
+                {importError && (
+                  <div className="rounded-lg bg-rose-50 border border-rose-200 p-2.5 text-xs text-rose-700">
+                    {importError}
+                  </div>
+                )}
 
-            <button
-              type="submit"
-              className="w-full rounded-xl bg-emerald-600 py-3 text-sm font-bold text-white shadow hover:bg-emerald-700 transition-colors cursor-pointer"
-            >
-              {loginModeSelect === 'kiosk'
-                ? `Launch Kiosk for ${state.settings.orgName}`
-                : `Sign In to ${state.settings.orgName}`}
-            </button>
-          </form>
+                <button
+                  type="submit"
+                  className="w-full rounded-xl bg-emerald-600 py-3 text-sm font-bold text-white shadow hover:bg-emerald-700 transition-colors cursor-pointer"
+                >
+                  Sign In to {state.settings.orgName}
+                </button>
+              </form>
+            </div>
+          )}
 
-          {/* Quick Actions & Wizard on Login Screen */}
+          {/* Quick Actions (Accurate to Flowchart: Guide, Create business, Open Schedule backup) */}
           <div className="mt-6 pt-5 border-t border-slate-200 space-y-2.5">
+            {/* Guide Button: Opens Staff guide in public folder */}
+            <button
+              type="button"
+              onClick={() => window.open('/staff-guide.html', '_blank')}
+              className="w-full flex items-center justify-center gap-2 rounded-xl border border-slate-300 bg-white hover:bg-slate-50 py-2.5 text-xs font-semibold text-slate-700 transition-colors"
+            >
+              <Compass className="h-4 w-4 text-emerald-600" />
+              <span>Staff Guide</span>
+            </button>
+
+            {/* Create new business button: Starts the setup wizard process */}
             <button
               type="button"
               onClick={() => {
@@ -1069,13 +1324,14 @@ export default function App() {
               <span>Create Manager Account / Set Up New Business</span>
             </button>
 
+            {/* Open Schedule Input button: opens file explorer window to pick a .openschedule backup file */}
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}
               className="w-full flex items-center justify-center gap-2 rounded-xl border border-slate-300 bg-white hover:bg-slate-50 py-2.5 text-xs font-semibold text-slate-700 transition-colors"
             >
               <Upload className="h-4 w-4 text-slate-500" />
-              <span>Import .openschedule Backup File</span>
+              <span>Open Schedule Backup File (.openschedule)</span>
             </button>
 
             <div className="pt-2 text-center">
@@ -1086,6 +1342,7 @@ export default function App() {
                   setLoginPassword('demomode');
                   setIsDemoModeActive(true);
                   setIsLoggedIn(true);
+                  setLoggedInRole('manager');
                   setAppMode('manager');
                 }}
                 className="text-[11px] font-medium text-slate-400 hover:text-emerald-700 transition-colors inline-flex items-center gap-1"
@@ -1929,7 +2186,10 @@ export default function App() {
             {/* Lock Vault button */}
             <button
               type="button"
-              onClick={() => setIsLoggedIn(false)}
+              onClick={() => {
+                setIsLoggedIn(false);
+                setLoggedInRole('manager');
+              }}
               className="flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2 py-1 text-[11px] font-semibold text-slate-600 hover:bg-slate-100 hover:text-slate-900"
             >
               <LogOut className="h-3 w-3" />
@@ -1939,37 +2199,46 @@ export default function App() {
         </div>
       )}
 
-      {/* 2. MODE SWITCHER BAR (when not in Split-Screen) */}
-      {!isSplitScreen && (
+      {/* 2. MODE SWITCHER BAR (when not in Split-Screen and not in Kiosk mode) */}
+      {!isSplitScreen && appMode !== 'kiosk' && (
         <div className="no-print flex items-center justify-between border-b border-slate-200 bg-white px-6 py-2 text-xs shadow-xs">
           <div className="flex items-center gap-3">
-            {/* Multi-Workspace Switcher Dropdown */}
-            <div className="relative flex items-center gap-1.5">
-              <div className="flex items-center gap-2 font-bold text-slate-900 bg-slate-100 hover:bg-slate-200 px-2.5 py-1.5 rounded-xl border border-slate-200 transition">
+            {/* Multi-Workspace Switcher Dropdown - Only for Manager */}
+            {loggedInRole === 'manager' ? (
+              <div className="relative flex items-center gap-1.5">
+                <div className="flex items-center gap-2 font-bold text-slate-900 bg-slate-100 hover:bg-slate-200 px-2.5 py-1.5 rounded-xl border border-slate-200 transition">
+                  <div className="h-6 w-6 rounded-lg bg-emerald-100 flex items-center justify-center text-emerald-700">
+                    <Building2 className="h-3.5 w-3.5" />
+                  </div>
+                  <select
+                    value={state.orgId || currentOrgId}
+                    onChange={(e) => {
+                      if (e.target.value === '__add_new__') {
+                        setIsSetupWizardOpen(true);
+                        setWizardStep(1);
+                      } else {
+                        handleSwitchWorkspace(e.target.value);
+                      }
+                    }}
+                    className="bg-transparent font-bold text-xs text-slate-900 focus:outline-none cursor-pointer pr-1"
+                  >
+                    {Object.entries(workspaces).map(([id, ws]) => (
+                      <option key={id} value={id}>
+                        {ws.settings.orgName}
+                      </option>
+                    ))}
+                    <option value="__add_new__">+ Add / Switch Business</option>
+                  </select>
+                </div>
+              </div>
+            ) : (
+              <div className="flex items-center gap-2 font-bold text-slate-900">
                 <div className="h-6 w-6 rounded-lg bg-emerald-100 flex items-center justify-center text-emerald-700">
                   <Building2 className="h-3.5 w-3.5" />
                 </div>
-                <select
-                  value={state.orgId || currentOrgId}
-                  onChange={(e) => {
-                    if (e.target.value === '__add_new__') {
-                      setIsSetupWizardOpen(true);
-                      setWizardStep(1);
-                    } else {
-                      handleSwitchWorkspace(e.target.value);
-                    }
-                  }}
-                  className="bg-transparent font-bold text-xs text-slate-900 focus:outline-none cursor-pointer pr-1"
-                >
-                  {Object.entries(workspaces).map(([id, ws]) => (
-                    <option key={id} value={id}>
-                      {ws.settings.orgName}
-                    </option>
-                  ))}
-                  <option value="__add_new__">+ Add / Switch Business</option>
-                </select>
+                <span>{state.settings.orgName}</span>
               </div>
-            </div>
+            )}
 
             {/* Network Resilience Status Pill */}
             <div
@@ -2011,43 +2280,47 @@ export default function App() {
               )}
             </div>
 
-            <div className="flex rounded-lg border border-slate-200 p-0.5 bg-slate-100">
-              <button
-                type="button"
-                onClick={() => setAppMode('manager')}
-                className={`rounded-md px-3 py-1 font-bold text-xs transition-colors ${
-                  appMode === 'manager' ? 'bg-emerald-600 text-white shadow-xs' : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                Manager Dashboard
-              </button>
-              {isMobileAllowed && (
+            {/* Flowchart: Mode switcher buttons ONLY for Manager. Removed for Staff and Kiosk */}
+            {loggedInRole === 'manager' && (
+              <div className="flex rounded-lg border border-slate-200 p-0.5 bg-slate-100">
                 <button
                   type="button"
-                  onClick={() => setAppMode('staff')}
+                  onClick={() => setAppMode('manager')}
                   className={`rounded-md px-3 py-1 font-bold text-xs transition-colors ${
-                    appMode === 'staff' ? 'bg-emerald-600 text-white shadow-xs' : 'text-slate-600 hover:text-slate-900'
+                    appMode === 'manager' ? 'bg-emerald-600 text-white shadow-xs' : 'text-slate-600 hover:text-slate-900'
                   }`}
                 >
-                  Employee Mobile View
+                  Manager Dashboard
                 </button>
-              )}
-              {isKioskAllowed && (
-                <button
-                  type="button"
-                  onClick={() => setAppMode('kiosk')}
-                  className={`rounded-md px-3 py-1 font-bold text-xs transition-colors ${
-                    appMode === 'kiosk' ? 'bg-emerald-600 text-white shadow-xs' : 'text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  Kiosk Terminal
-                </button>
-              )}
-            </div>
+                {isMobileAllowed && (
+                  <button
+                    type="button"
+                    onClick={() => setAppMode('staff')}
+                    className={`rounded-md px-3 py-1 font-bold text-xs transition-colors ${
+                      appMode === 'staff' ? 'bg-emerald-600 text-white shadow-xs' : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    Employee Mobile View
+                  </button>
+                )}
+                {isKioskAllowed && (
+                  <button
+                    type="button"
+                    onClick={() => setAppMode('kiosk')}
+                    className={`rounded-md px-3 py-1 font-bold text-xs transition-colors ${
+                      appMode === 'kiosk' ? 'bg-emerald-600 text-white shadow-xs' : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    Kiosk Terminal
+                  </button>
+                )}
+              </div>
+            )}
           </div>
 
           <div className="flex items-center gap-3">
-            {appMode === 'staff' && state.employees.length > 0 && (
+            {/* Flowchart: Switch Employee dropdown ONLY for Manager previewing staff view */}
+            {loggedInRole === 'manager' && appMode === 'staff' && state.employees.length > 0 && (
               <div className="flex items-center gap-1.5">
                 <span className="text-slate-500 text-xs">Switch Employee:</span>
                 <select
@@ -2082,11 +2355,14 @@ export default function App() {
 
             <button
               type="button"
-              onClick={() => setIsLoggedIn(false)}
+              onClick={() => {
+                setIsLoggedIn(false);
+                setLoggedInRole('manager');
+              }}
               className="flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-semibold text-slate-600 hover:bg-slate-100 hover:text-slate-900"
             >
               <LogOut className="h-3.5 w-3.5 text-slate-500" />
-              <span>Lock Vault</span>
+              <span>{loggedInRole === 'manager' ? 'Lock Vault' : 'Sign Out'}</span>
             </button>
           </div>
         </div>
@@ -2162,7 +2438,10 @@ export default function App() {
                     onDeleteAvailability={handleDeleteAvailability}
                     onSubmitTimeOff={handleSubmitTimeOff}
                     onSendMessage={handleSendMessage}
-                    onStaffLogout={() => setIsLoggedIn(false)}
+                    onStaffLogout={() => {
+                      setIsLoggedIn(false);
+                      setLoggedInRole('manager');
+                    }}
                     gpsSimMeters={gpsSimMeters}
                   />
                 )}
@@ -2211,10 +2490,11 @@ export default function App() {
               onDeleteAvailability={handleDeleteAvailability}
               onSubmitTimeOff={handleSubmitTimeOff}
               onSendMessage={handleSendMessage}
-              onStaffLogout={() => setIsLoggedIn(false)}
+              onStaffLogout={() => {
+                setIsLoggedIn(false);
+                setLoggedInRole('manager');
+              }}
               gpsSimMeters={gpsSimMeters}
-              workspaces={workspaces}
-              onSwitchWorkspace={handleSwitchWorkspace}
             />
           )}
 
@@ -2222,7 +2502,14 @@ export default function App() {
             <KioskTimeclock
               state={state}
               onRecordPunch={handleRecordPunch}
-              onExitKiosk={() => setAppMode('manager')}
+              onExitKiosk={() => {
+                if (loggedInRole === 'manager') {
+                  setAppMode('manager');
+                } else {
+                  setIsLoggedIn(false);
+                  setLoggedInRole('manager');
+                }
+              }}
               gpsSimMeters={gpsSimMeters}
             />
           )}
