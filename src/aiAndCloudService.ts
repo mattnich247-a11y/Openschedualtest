@@ -319,10 +319,262 @@ export interface AtomicCloudWriteResult {
 }
 
 /**
+ * IndexedDB helper for secondary browser resilience across localStorage clearing
+ */
+const IDB_NAME = 'OpenScheduleCloudDB';
+const IDB_STORE = 'cloud_backups';
+
+function openIndexedDb(): Promise<IDBDatabase | null> {
+  if (typeof window === 'undefined' || !window.indexedDB) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    try {
+      const req = window.indexedDB.open(IDB_NAME, 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(IDB_STORE)) {
+          db.createObjectStore(IDB_STORE, { keyPath: 'id' });
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+export async function idbSaveBackup(key: string, state: OrganizationState): Promise<void> {
+  try {
+    const db = await openIndexedDb();
+    if (!db) return;
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).put({ id: key, state, savedAt: new Date().toISOString() });
+  } catch {}
+}
+
+export async function idbGetBackup(key: string): Promise<OrganizationState | null> {
+  try {
+    const db = await openIndexedDb();
+    if (!db) return null;
+    return new Promise((resolve) => {
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const req = tx.objectStore(IDB_STORE).get(key);
+      req.onsuccess = () => {
+        if (req.result && req.result.state) {
+          resolve(req.result.state);
+        } else {
+          resolve(null);
+        }
+      };
+      req.onerror = () => resolve(null);
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Saves/upserts the full organization backup to the remote cloud server (Supabase / REST relay).
+ */
+export async function saveBackupToCloudServer(
+  state: OrganizationState,
+  customUrl?: string,
+  customKey?: string
+): Promise<{ success: boolean; message: string }> {
+  const projectUrl = (
+    customUrl ||
+    state.settings?.cloudSync?.projectUrl ||
+    (typeof window !== 'undefined' ? localStorage.getItem('openschedule_cloud_server_url') : '') ||
+    ''
+  )
+    .trim()
+    .replace(/\/$/, '');
+
+  const apiKey = (
+    customKey ||
+    state.settings?.cloudSync?.apiKey ||
+    (typeof window !== 'undefined' ? localStorage.getItem('openschedule_cloud_server_public_key') : '') ||
+    ''
+  ).trim();
+
+  const orgId = state.orgId || 'org_main';
+
+  // 1. Always save to local multi-layer fallback cache (SessionStorage & IndexedDB)
+  if (typeof sessionStorage !== 'undefined') {
+    try {
+      sessionStorage.setItem(`openschedule_backup_${orgId}`, JSON.stringify(state));
+      sessionStorage.setItem('openschedule_last_active_backup', JSON.stringify(state));
+    } catch {}
+  }
+  await idbSaveBackup(orgId, state);
+  await idbSaveBackup('last_saved_business', state);
+  if (projectUrl) {
+    await idbSaveBackup(`server_${projectUrl}`, state);
+  }
+
+  // 2. If no remote URL or simulated local relay, return success
+  if (!projectUrl || !apiKey || projectUrl.includes('openschedule.local') || projectUrl === 'local_relay') {
+    return { success: true, message: 'Saved to local cloud relay storage.' };
+  }
+
+  // 3. Real HTTP POST upsert to Supabase PostgREST table: openschedule_sync
+  const payload = {
+    id: orgId,
+    payload: state,
+    updated_at: new Date().toISOString(),
+  };
+
+  const candidateEndpoints = [
+    `${projectUrl}/rest/v1/openschedule_sync`,
+    `${projectUrl}/rest/v1/openschedule_backup`,
+    `${projectUrl}/rest/v1/openschedule_state`,
+  ];
+
+  for (const endpoint of candidateEndpoints) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 7000);
+
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          apikey: apiKey,
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+          Prefer: 'resolution=merge-duplicates',
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+
+      if (res.ok || res.status === 201 || res.status === 204) {
+        return { success: true, message: 'Successfully backed up to cloud server.' };
+      }
+
+      // If conflict (409), try PATCH
+      if (res.status === 409) {
+        const patchRes = await fetch(`${endpoint}?id=eq.${encodeURIComponent(orgId)}`, {
+          method: 'PATCH',
+          headers: {
+            apikey: apiKey,
+            Authorization: `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(payload),
+        });
+        if (patchRes.ok) {
+          return { success: true, message: 'Updated cloud server backup.' };
+        }
+      }
+    } catch (err) {
+      console.warn(`Save backup candidate endpoint failed (${endpoint}):`, err);
+    }
+  }
+
+  return { success: false, message: 'Saved locally; cloud server unreachable or table not configured.' };
+}
+
+/**
+ * Fetches the organization state backup from the remote cloud server (Supabase / REST relay).
+ */
+export async function fetchBackupFromCloudServer(
+  projectUrl: string,
+  apiKey: string
+): Promise<OrganizationState | null> {
+  const trimmedUrl = projectUrl.trim().replace(/\/$/, '');
+  const trimmedKey = apiKey.trim();
+
+  if (!trimmedUrl && !trimmedKey) return null;
+
+  // 1. Real remote fetch if URL is a valid web address
+  if (trimmedUrl.startsWith('http://') || trimmedUrl.startsWith('https://')) {
+    if (!trimmedUrl.includes('openschedule.local')) {
+      const candidateEndpoints = [
+        `${trimmedUrl}/rest/v1/openschedule_sync?select=*&order=updated_at.desc&limit=10`,
+        `${trimmedUrl}/rest/v1/openschedule_backup?select=*&order=updated_at.desc&limit=10`,
+        `${trimmedUrl}/rest/v1/openschedule_state?select=*&limit=10`,
+        `${trimmedUrl}/rest/v1/sync_roster?select=*&order=updated_at.desc&limit=10`,
+        `${trimmedUrl}/api/backup`,
+        `${trimmedUrl}/backup`,
+      ];
+
+      for (const endpoint of candidateEndpoints) {
+        try {
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 6000);
+
+          const res = await fetch(endpoint, {
+            method: 'GET',
+            headers: {
+              apikey: trimmedKey,
+              Authorization: `Bearer ${trimmedKey}`,
+              Accept: 'application/json',
+            },
+            signal: controller.signal,
+          });
+          clearTimeout(timeout);
+
+          if (res.ok) {
+            const data = await res.json();
+            const records = Array.isArray(data) ? data : [data];
+            for (const item of records) {
+              if (!item) continue;
+              let candidateState = item.payload || item.state || item.data || (item.settings ? item : null);
+              if (typeof candidateState === 'string') {
+                try {
+                  candidateState = JSON.parse(candidateState);
+                } catch {}
+              }
+              if (
+                candidateState &&
+                candidateState.settings &&
+                candidateState.settings.orgName &&
+                candidateState.employees
+              ) {
+                return candidateState as OrganizationState;
+              }
+            }
+          }
+        } catch (err) {
+          console.warn(`Fetch backup candidate endpoint failed (${endpoint}):`, err);
+        }
+      }
+    }
+  }
+
+  // 2. Check IndexedDB persistent store (survives localStorage.clear())
+  const idbServerBackup = await idbGetBackup(`server_${trimmedUrl}`);
+  if (idbServerBackup && idbServerBackup.settings?.orgName) {
+    return idbServerBackup;
+  }
+  const idbLastBackup = await idbGetBackup('last_saved_business');
+  if (idbLastBackup && idbLastBackup.settings?.orgName) {
+    return idbLastBackup;
+  }
+
+  // 3. Check SessionStorage (survives localStorage.clear() in active tab)
+  if (typeof sessionStorage !== 'undefined') {
+    try {
+      const sessionRaw = sessionStorage.getItem('openschedule_last_active_backup');
+      if (sessionRaw) {
+        const parsed = JSON.parse(sessionRaw);
+        if (parsed && parsed.settings?.orgName) {
+          return parsed;
+        }
+      }
+    } catch {}
+  }
+
+  return null;
+}
+
+/**
  * Atomic Cloud Backup:
  * 1. Writes encrypted / serialized snapshot to staging slot {orgId}_backup_staging.openschedule
  * 2. Computes and verifies SHA-256 checksum
  * 3. Atomically promotes to main backup slot {orgId}_backup_main.openschedule
+ * 4. Pushes backup to remote Cloud Server (Supabase/REST)
  */
 export async function atomicCloudWrite(
   state: OrganizationState
@@ -357,6 +609,11 @@ export async function atomicCloudWrite(
   // Promote staging to main
   localStorage.setItem(`openschedule_cloud_main_${orgId}`, stagingPayload);
   markStateDirty(false);
+
+  // Background save to remote cloud server
+  saveBackupToCloudServer(state).catch((err) =>
+    console.warn('Background cloud backup save error:', err)
+  );
 
   return {
     success: true,
@@ -404,25 +661,72 @@ export async function hydrateFromCloudIfNewer(
   localState: OrganizationState
 ): Promise<{ updated: boolean; state: OrganizationState; reason?: string }> {
   const orgId = localState.orgId || 'org_main';
-  const mainRaw = localStorage.getItem(`openschedule_cloud_main_${orgId}`);
-  if (!mainRaw) return { updated: false, state: localState };
+  const projectUrl =
+    localState.settings?.cloudSync?.projectUrl ||
+    (typeof window !== 'undefined' ? localStorage.getItem('openschedule_cloud_server_url') : '') ||
+    '';
+  const apiKey =
+    localState.settings?.cloudSync?.apiKey ||
+    (typeof window !== 'undefined' ? localStorage.getItem('openschedule_cloud_server_public_key') : '') ||
+    '';
 
-  try {
-    const parsed = JSON.parse(mainRaw);
-    const cloudState: OrganizationState = parsed.state;
-    const cloudTs = cloudState.versionTimestampMs || 0;
-    const localTs = localState.versionTimestampMs || 0;
+  // 1. Try remote cloud server first
+  if (projectUrl && apiKey) {
+    try {
+      const remoteState = await fetchBackupFromCloudServer(projectUrl, apiKey);
+      if (remoteState && remoteState.settings?.orgName) {
+        const remoteTs = remoteState.versionTimestampMs || 0;
+        const localTs = localState.versionTimestampMs || 0;
 
-    if (cloudTs > localTs) {
-      return {
-        updated: true,
-        state: cloudState,
-        reason: `Restored newest cloud backup from ${new Date(cloudTs).toLocaleTimeString()} (saved by ${cloudState.lastModifiedBy || 'Manager'})`,
-      };
+        // If remote is newer, or if local is default fallback Bistro 313 preset and remote differs
+        if (
+          remoteTs > localTs ||
+          localState.orgId === 'org_bistro313' ||
+          localState.settings?.orgName !== remoteState.settings?.orgName
+        ) {
+          if (typeof window !== 'undefined') {
+            localStorage.setItem(
+              `openschedule_cloud_main_${remoteState.orgId || orgId}`,
+              JSON.stringify({
+                orgId: remoteState.orgId || orgId,
+                state: remoteState,
+                writtenAtIso: new Date().toISOString(),
+              })
+            );
+          }
+          return {
+            updated: true,
+            state: remoteState,
+            reason: `Restored cloud backup for ${remoteState.settings.orgName}`,
+          };
+        }
+      }
+    } catch (err) {
+      console.warn('Remote cloud hydration error:', err);
     }
-  } catch (err) {
-    console.warn('Unable to hydrate from cloud backup', err);
   }
+
+  // 2. Check localStorage
+  const mainRaw = typeof window !== 'undefined' ? localStorage.getItem(`openschedule_cloud_main_${orgId}`) : null;
+  if (mainRaw) {
+    try {
+      const parsed = JSON.parse(mainRaw);
+      const cloudState: OrganizationState = parsed.state;
+      const cloudTs = cloudState.versionTimestampMs || 0;
+      const localTs = localState.versionTimestampMs || 0;
+
+      if (cloudTs > localTs) {
+        return {
+          updated: true,
+          state: cloudState,
+          reason: `Restored cloud backup from ${new Date(cloudTs).toLocaleTimeString()} (saved by ${cloudState.lastModifiedBy || 'Manager'})`,
+        };
+      }
+    } catch (err) {
+      console.warn('Unable to hydrate from local cloud backup cache', err);
+    }
+  }
+
   return { updated: false, state: localState };
 }
 

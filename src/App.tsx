@@ -67,9 +67,11 @@ import { importOrganizationFile } from './calendarAndExport';
 import {
   atomicCloudWrite,
   checkForCloudConflict,
+  fetchBackupFromCloudServer,
   getIsDirty,
   hydrateFromCloudIfNewer,
   markStateDirty,
+  saveBackupToCloudServer,
   syncToCloud,
   testCloudConnection,
 } from './aiAndCloudService';
@@ -618,11 +620,38 @@ export default function App() {
 
         if (activeUrl && activeKey) {
           try {
-            const hydration = await hydrateFromCloudIfNewer(state);
-            if (hydration.updated) {
-              setState(hydration.state);
-              if (hydration.state.employees.length > 0) {
-                setCurrentEmployee(hydration.state.employees[0]);
+            const cloudState = await fetchBackupFromCloudServer(activeUrl, activeKey);
+            if (cloudState && cloudState.settings?.orgName) {
+              setState(cloudState);
+              setCurrentOrgId(cloudState.orgId || 'org_main');
+              setWorkspaces((prev) => ({
+                ...prev,
+                [cloudState.orgId || 'org_main']: cloudState,
+              }));
+              if (cloudState.employees && cloudState.employees.length > 0) {
+                setCurrentEmployee(cloudState.employees[0]);
+              }
+              localStorage.setItem('openschedule_state', JSON.stringify(cloudState));
+              localStorage.setItem('openschedule_current_org_id', cloudState.orgId || 'org_main');
+              localStorage.setItem(
+                'openschedule_workspaces',
+                JSON.stringify({ [cloudState.orgId || 'org_main']: cloudState })
+              );
+              localStorage.setItem(
+                `openschedule_cloud_main_${cloudState.orgId || 'org_main'}`,
+                JSON.stringify({
+                  orgId: cloudState.orgId || 'org_main',
+                  state: cloudState,
+                  writtenAtIso: new Date().toISOString(),
+                })
+              );
+            } else {
+              const hydration = await hydrateFromCloudIfNewer(state);
+              if (hydration.updated) {
+                setState(hydration.state);
+                if (hydration.state.employees.length > 0) {
+                  setCurrentEmployee(hydration.state.employees[0]);
+                }
               }
             }
           } catch (err) {
@@ -665,27 +694,46 @@ export default function App() {
       setCloudServerUrl(cleanUrl);
       setCloudServerPublicKey(cleanKey);
 
-      const updatedSettings = {
-        ...state.settings,
-        cloudSync: {
-          ...state.settings.cloudSync,
-          enabled: true,
-          projectUrl: cleanUrl,
-          apiKey: cleanKey,
-        },
-      };
-      const updatedState = { ...state, settings: updatedSettings };
-      setState(updatedState);
-
-      const hydration = await hydrateFromCloudIfNewer(updatedState);
-      if (hydration.updated) {
-        setState(hydration.state);
-        if (hydration.state.employees.length > 0) {
-          setCurrentEmployee(hydration.state.employees[0]);
+      // Directly fetch the business backup from the cloud server!
+      const cloudState = await fetchBackupFromCloudServer(cleanUrl, cleanKey);
+      if (cloudState && cloudState.settings?.orgName) {
+        setState(cloudState);
+        setCurrentOrgId(cloudState.orgId || 'org_main');
+        setWorkspaces((prev) => ({
+          ...prev,
+          [cloudState.orgId || 'org_main']: cloudState,
+        }));
+        if (cloudState.employees && cloudState.employees.length > 0) {
+          setCurrentEmployee(cloudState.employees[0]);
         }
-        showToast(hydration.reason || '✓ Loaded latest backup from cloud server.');
+        localStorage.setItem('openschedule_state', JSON.stringify(cloudState));
+        localStorage.setItem('openschedule_current_org_id', cloudState.orgId || 'org_main');
+        localStorage.setItem(
+          'openschedule_workspaces',
+          JSON.stringify({ [cloudState.orgId || 'org_main']: cloudState })
+        );
+        localStorage.setItem(
+          `openschedule_cloud_main_${cloudState.orgId || 'org_main'}`,
+          JSON.stringify({
+            orgId: cloudState.orgId || 'org_main',
+            state: cloudState,
+            writtenAtIso: new Date().toISOString(),
+          })
+        );
+        showToast(`✓ Connected to ${cloudState.settings.orgName}! Please sign in.`);
       } else {
-        showToast('✓ Cloud server connected successfully! Please sign in.');
+        const updatedSettings = {
+          ...state.settings,
+          cloudSync: {
+            ...state.settings.cloudSync,
+            enabled: true,
+            projectUrl: cleanUrl,
+            apiKey: cleanKey,
+          },
+        };
+        const updatedState = { ...state, settings: updatedSettings };
+        setState(updatedState);
+        showToast('✓ Cloud server connected. Please sign in or import your business backup.');
       }
     } catch (err: any) {
       setCloudConnectError(err.message || 'Failed to connect to cloud server.');
@@ -805,6 +853,9 @@ export default function App() {
         setCloudServerUrl(imported.settings.cloudSync.projectUrl);
         setCloudServerPublicKey(imported.settings.cloudSync.apiKey);
       }
+      saveBackupToCloudServer(imported).catch((err) =>
+        console.warn('Cloud backup save error:', err)
+      );
       setIsLoggedIn(true);
       setLoggedInRole('manager');
       setAppMode('manager');
@@ -836,6 +887,9 @@ export default function App() {
         setCloudServerUrl(imported.settings.cloudSync.projectUrl);
         setCloudServerPublicKey(imported.settings.cloudSync.apiKey);
       }
+      saveBackupToCloudServer(imported).catch((err) =>
+        console.warn('Cloud backup save error:', err)
+      );
       setIsLoggedIn(true);
       setLoggedInRole('manager');
       setAppMode('manager');
@@ -997,6 +1051,9 @@ export default function App() {
     setState(newOrgState);
     setCurrentEmployee(managerEmp);
     setIsSetupWizardOpen(false);
+    saveBackupToCloudServer(newOrgState, wizardCloudProjectUrl, wizardCloudApiKey).catch((err) =>
+      console.warn('Initial cloud backup save error:', err)
+    );
     setLoggedInRole('manager');
     setIsLoggedIn(true);
     setAppMode('manager');
